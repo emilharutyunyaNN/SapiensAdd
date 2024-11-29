@@ -114,9 +114,9 @@ def make_validation(dir, img_list):
         print("-----", src, dst)
         shutil.move(src, dst)  
     
-lst = show_content("/home/emil/Keypoints/Sapiens/Crowdpose/annotations/crowdpose_val.json")[1]
+#lst = show_content("/home/emil/Keypoints/Sapiens/Crowdpose/annotations/crowdpose_val.json")[1]
 #print(lst)
-make_validation("/home/emil/Keypoints/Sapiens/Crowdpose/images", lst)
+#make_validation("/home/emil/Keypoints/Sapiens/Crowdpose/images", lst)
 
 #print("----- bbox coco: ", show_content("/home/emil/Keypoints/Sapiens/Coco/person_detection_results/COCO_val2017_detections_AP_H_70_person_new.json"))
 #print("----- annot coco: ", show_content("/home/emil/Keypoints/Sapiens/Coco/annotations/coco_wholebody_val_v1.0.json"))
@@ -128,30 +128,41 @@ make_validation("/home/emil/Keypoints/Sapiens/Crowdpose/images", lst)
 def make_bbox_ann(och_val, path = "."):
     bbox_annots = []
     och_val = os.path.abspath(och_val)
+    print(och_val)
     with open(och_val, 'r') as f:
         data = json.load(f)
-    
+    print(len(data['annotations']))
     for ann in data["annotations"]:
         if 'segmentations' in ann.keys():
             bbox_annots.append({
                 "image_id": ann['image_id'],
-                "category_id": ann['category_id'],
+                "category_id": [ann["bbox"][0], ann["bbox"][1], ann["bbox"][0]+ ann["bbox"][2], ann["bbox"][1]+ ann["bbox"][3]],
                 "bbox": ann["bbox"],
                 "score": 1.0,
+                "class": ann["class"],
                 "segmentation": ann["segmentation"]
             })
         else:
+            if ann["image_id"] == 1:
+                print(ann["image_id"])
             bbox_annots.append({
                 "image_id": ann['image_id'],
                 "category_id": ann['category_id'],
-                "bbox": ann["bbox"],
-                "score": 1.0
+                "bbox": [ann["bbox"][0], ann["bbox"][1], ann["bbox"][0]+ ann["bbox"][2], ann["bbox"][1]+ ann["bbox"][3]],
+                "score": 1.0,
+                "class": ann["class"]
             })
-        
-    with open(f"{path}/person_detection_results/bbox_annotations.json", "w") as f:
+            
+    print(len(bbox_annots))
+    if "person_detection_results" not in os.listdir(path):
+        os.makedirs("person_detection_results")
+    with open(f"{path}/bbox_all_val_new_final.json", "w") as f:
         json.dump(bbox_annots, f, indent=4)
         
         
 #make_bbox_ann("/home/emil/Keypoints/Sapiens/OCHuman/annotations/ochuman_coco_format_val_range_0.00_1.00.json")
 
 #make_bbox_ann("/home/emil/Keypoints/Sapiens/Crowdpose/annotations/crowdpose_val.json", "/home/emil/Keypoints/Sapiens/Crowdpose")
+
+make_bbox_ann("./coco_all_val_new_final.json")
+
