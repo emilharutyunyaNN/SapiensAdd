@@ -292,7 +292,7 @@ class TopdownPoseEstimator(BasePoseEstimator):
     
 @MODELS.register_module()
 class PoseLSTM(nn.Module):
-    def __init__(self, num_keypoints, height, width, lstm_hidden_size=256, lstm_num_layers=2,output_size=10  ):
+    def __init__(self, num_keypoints, height, width, lstm_hidden_size=256, lstm_num_layers=2,output_size=10, filters = 8):
         super(PoseLSTM, self).__init__()
         self.num_keypoints = num_keypoints
         self.height = height
@@ -301,8 +301,9 @@ class PoseLSTM(nn.Module):
         self.lstm_num_layers = lstm_num_layers
         self.output_size = output_size
         
-        self.input_size =int( num_keypoints * height * width)
-        
+        self.input_size =int(height * width)
+        self.conv1 = nn.Conv2d(in_channels=1, out_channels=filters, kernel_size=3, stride = 2, padding=1)
+        self.conv2 = nn.Conv2d(in_channels=filters, out_channels=filters*2, kernel_size=3, stride = 2, padding=1)
         #print("input size: ", self.input_size)
         self.lstm = nn.LSTM(
             input_size=self.input_size, 
@@ -317,28 +318,44 @@ class PoseLSTM(nn.Module):
         self.init_weights()
     def forward(self, x):
         #print("heatmaps", self.process_x(x))
-        
+        if x.dim() == 3:
+            x= x.unsqueeze(0) # -> becomes [1, frame #, kpts #, height, width]
+        #x = self.lstm(x)
+        print("pre: ", x.shape)
+        B,T,H,W = x.size()
         
        
         # heatmap output is [# of frames, # of kpts, height, width]
         #print("lstm input:", x)
-        if x.dim() == 4:
-            x= x.unsqueeze(0) # -> becomes [1, frame #, kpts #, height, width]
-        #x = self.lstm(x)
+        convolved_frames = []
+        for t in range(T):
+            
+            frame = x[:,t,:,:].unsqueeze(1) # becomes B,1,H,W to do convolution
+            print("frame: ", frame.shape)
+            conv_out = torch.relu(self.conv1(frame))
+            conv_out = torch.relu(self.conv2(conv_out))
+            #conv_out = conv_out.view(-1)
+            print("conv: ", conv_out.shape)
+            convolved_frames.append(conv_out)
+            
         
-        batch_size, seq_len, num_keypoints, h, w = x.size()
-        x = x.view(batch_size, seq_len, -1)
+        convolved_frames = torch.stack(convolved_frames, dim=1) # -> (B,T,C,H',W')
+        print("conv out: ", convolved_frames.shape)
+        convolved_frames = convolved_frames.view(B,T,-1) # -> (B,T,C*H'*W')
+        print("conv out: ", convolved_frames.shape)
+        #batch_size, seq_len, h, w = x.size()
+        #x = x.view(batch_size, seq_len, -1)
         
-        lstm_out, _ = self.lstm(x)
+        lstm_out, _ = self.lstm(convolved_frames)
         sequence_output = lstm_out.mean(dim=1)
         
-        out = self.fc(sequence_output) # 256->6
+        out = self.fc(sequence_output) # 256->21
         return out
     
     def init_weights(self):
         print("called")
         for name, param in self.lstm.named_parameters():
-            if 'weight_ih' in name:
+            if 'weight_ih' in name or 'conv' in name:
                 nn.init.xavier_normal_(param)
             elif 'weight_hh' in name:
                 nn.init.orthogonal_(param)
@@ -353,5 +370,42 @@ class PoseLSTM(nn.Module):
         
                 #self.grad_logger.info(f"Pramater {name} has no Gradient")
         #pass
+        
+@MODELS.register_module()
+class PoseVecLSTM(nn.Module):
+    def __init__(self, num_keypoints=17, lstm_hidden_size=128, lstm_num_layers=2,output_size=10):
+        super(PoseVecLSTM, self).__init__()
+        self.num_keypoints = num_keypoints
+        self.lstm_hidden_size = lstm_hidden_size
+        self.lstm_num_layers = lstm_num_layers
+        self.output_size = output_size
+        
+        self.lstm = nn.LSTM(input_size=self.num_keypoints*2, hidden_size=self.lstm_hidden_size, 
+                            num_layers=self.lstm_num_layers,batch_first=True)
+        
+        self.fc = nn.Linear(self.lstm_hidden_size, self.output_size)
+        
+        self.init_weights()
+    def forward(self, x):
+        x, _ = self.lstm(x)
+        out = self.fc(x[:,-1,:])
+        
+        return out
+    
+    def init_weights(self):
+        print("called")
+        for name, param in self.lstm.named_parameters():
+            if 'weight_ih' in name or 'conv' in name:
+                nn.init.xavier_normal_(param)
+            elif 'weight_hh' in name:
+                nn.init.orthogonal_(param)
+            elif 'bias' in name:
+                nn.init.constant_(param, 0.0)
+
+        for param in self.fc.parameters():
+            if param.dim() > 1:
+                nn.init.xavier_normal_(param)
+            else:
+                nn.init.constant_(param, 0.0)
         
        
