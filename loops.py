@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 import os, shutil
-
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from sklearn.metrics import classification_report, precision_recall_fscore_support
@@ -20,6 +20,7 @@ from .amp import autocast
 from .base_loop import BaseLoop
 from .utils import calc_dynamic_intervals
 import socket
+import torch.nn.functional as F
 
 
 @LOOPS.register_module()
@@ -500,7 +501,8 @@ class TrainLSTMLoop(IterBasedTrainLoop):
         if os.path.exists(grad_log):
             os.remove(grad_log)
         self.fp16 = fp16
-        self.lstm_optimizer = torch.optim.Adam(self.runner.temporal_model.parameters(), lr=1e-3)
+        print("mixed precision: ", self.fp16)
+        self.lstm_optimizer = torch.optim.Adam(self.runner.temporal_model.parameters(), lr=1e-4)
         self.val_dataloader = self.runner._val_loop.dataloader
         print("val dataloader: ", self.val_dataloader)
         self.temporal_device = self.runner.cfg.get('device_map')['temporal']
@@ -527,6 +529,7 @@ class TrainLSTMLoop(IterBasedTrainLoop):
         self.runner.model.eval()
         self.runner.temporal_model.train()
         #idx = 0
+        torch.autograd.set_detect_anomaly(True)
         for name, param in self.runner.temporal_model.named_parameters():
             #print("---", name, ">>>", param.requires_grad)
             if param.grad is not None:
@@ -543,6 +546,9 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             
             
             data_batch = next(self.dataloader_iterator)
+            
+            #print(data_batch)
+            #eturn 
             #print([dt["data_samples"].img_id for dt in data_batch[0]])
             #print([dt["data_samples"].img_id for dt in data_batch[1]])
             #return
@@ -552,9 +558,9 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             #print("databatch: ",self.dataloader, len(data_batch), data_batch[0])
             #return
             #continue
-            print("len data batch: ", len(data_batch[0]), len(data_batch))
+            #print("len data batch: ", len(data_batch[0]), len(data_batch))
             with torch.no_grad():
-                with autocast(enabled=self.fp16):
+                with autocast(enabled=False):
                     pose_outputs = self.runner.model.test_step(data_batch)
             
             #check_mem()    
@@ -575,11 +581,18 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             target = target.to(f"cuda:{self.temporal_device}")
             #check_mem()
             #print("pose output: ", pose_outputs[0][0], type(pose_outputs[0]))
-            print("lstm_input: ", len(lstm_input))
-            lstm_input = self.process_x(lstm_input)
+            #print("lstm_input: ", len(lstm_input))
+            #print("lstm input: ", min(lstm_input[0]))
+            lstm_in, lstm_vec_input = self.process_x(lstm_input)
             #return
             #check_mem()
-            print("lstm input: ", lstm_input.shape)
+            #print(type(type(self.runner.temporal_model)), self.runner.temporal_model)
+            if "PoseVecLSTM" in str(type(self.runner.temporal_model)):
+                lstm_input = lstm_vec_input
+                #print("lstm vec shape: ", lstm_input.shape)
+            else:
+                lstm_input = lstm_in
+            #print("lstm input: ", lstm_input[0].min().item())
             lstm_input = lstm_input.to(f"cuda:{self.temporal_device}")
             #self.runner.temporal_model = self.runner.temporal_model.to(self.temporal_device)
             #check_mem()
@@ -595,6 +608,7 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             #print(target.device, lstm_out.device)
             if len(target.shape) >1:
                 target = target.view(-1)
+            print(lstm_out.shape, target.shape)
             loss = self.loss_fn(lstm_out, target)
             #del target, pose_outputs
             
@@ -602,17 +616,21 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             # Backpropagate and optimize
             self.lstm_optimizer.zero_grad()
             loss.backward()
+            for name, param in self.runner.temporal_model.named_parameters():
+                if param.grad is not None:
+                    print(f"Gradient norm of {name}: {param.grad.norm().item()}")
             self.lstm_optimizer.step()
             
             for name, param in self.runner.temporal_model.named_parameters():
                 if param.grad is not None:
                     grad_mean = param.grad.abs().mean().item()
+                    print(f" {name} grad : ", grad_mean)
                     self.grad_logger.info(f"Pramater {name}: {grad_mean:.4f}")
                 else:
                     self.grad_logger.info(f"Pramater {name} has no Gradient")
             torch.cuda.empty_cache()
-            print("LSTM loss:", loss.item())
-            print("True class and the predicted: ", target, " ---- ", torch.argmax(lstm_out, dim=1) )
+            #print("LSTM loss:", loss.item())
+            #print("True class and the predicted: ", target, " ---- ", torch.argmax(lstm_out, dim=1) )
             
             #self.runner.call_hook(
              #   'after_train_iter',
@@ -649,25 +667,52 @@ class TrainLSTMLoop(IterBasedTrainLoop):
         elif isinstance(x, list) and isinstance(x[0], list): 
             #print("here list")
             x_new = []
+            x_vec_new = []
             for sample in x:
-                sample = [predinst.pred_fields.heatmaps for predinst in sample]
+                sample_kp_sc = [predinst.pred_instances.keypoint_scores for predinst in sample]
+                sample_kp = [predinst.pred_instances.keypoints[0] for predinst in sample]
+                sample_img_id = [predinst.img_path for predinst in sample]
+                #print(sample[0])
+                #print(sample_kp)
+                lstm_kp_data = np.stack(sample_kp, axis = -2)
+                lsmt_data = torch.tensor(lstm_kp_data, dtype=torch.float32)
+                lsmt_data = lsmt_data.view(1,4,-1)
+                
+                #print(lstm_data, lstm_data.shape)
+                #print("smpl: ", list(zip(sample_kp,sample_img_id)))
+                #return
+                #return 
+                sample = [torch.sigmoid(predinst.pred_fields.heatmaps) for predinst in sample]
                 #print
+                #print(len(sample), sample[0].shape)
                 #min_vls = sample[0].view(sample[0].size(0), -1).min(dim=1, keepdim = True)
         #print("means: ", mean_vls.shape, mean_vls)
                 #max_vls = sample[0].view(sample[0].size(0), -1).max(dim=1, keepdim = True)
                 #print("inp: ", len(inp))
                 
                 #print("min: ", sample[0].min().item(), "\n", "max values: ", sample[0].max().item())
-                sample = [self.normalize(torch.sigmoid(one)) for one in sample]
+                sample = [self.maxpool_heatmaps(smpl) for smpl in sample]
+                #print("sample: ",sample[0].shape)
+                #if len(sample[0].shape)<3:
+                  #  sample = [spl.unsqueeze(0) for spl in sample]
+                #sample = [F.max_pool2d(heatmap, kernel_size=4, stride=4) for heatmap in sample]
+                #sample = [spl.squeeze(0) for spl in sample]
+                #print("sample: ",sample[0].shape)
+                #sample = [self.normalize(torch.sigmoid(one)) for one in sample]
                 #return
-                sample = torch.stack(sample, dim = 0)   
+                sample = torch.stack(sample, dim = 0)
+                #print("sample: ",sample.shape)   
                 x_new.append(sample)
-            x = torch.stack(x_new, dim=0)
+                x_vec_new.append(lsmt_data)
+            x_maps = torch.stack(x_new, dim=0)
+            x_vecs = torch.stack(x_vec_new, dim=0)
             #print(x_new)
+            if x_vecs.dim()>=4:
+                x_vecs = x_vecs.squeeze(1)
             
-        #print("x: ", x)
+        # print("x: ", x_maps.shape, x_vecs.shape)
         
-        return x
+        return x_maps, x_vecs
     
     def validate(self):
         
@@ -692,7 +737,14 @@ class TrainLSTMLoop(IterBasedTrainLoop):
                     lstm_input = pose_outputs[0]
                     target = pose_outputs[1][0]    
                     
-                lstm_input = self.process_x(lstm_input).to(f"cuda:{self.temporal_device}")
+                lstm_in, lstm_vec_input = self.process_x(lstm_input)
+                
+                if "PoseVecLSTM" in str(type(self.runner.temporal_model)):
+                    lstm_input = lstm_vec_input
+                    #print("lstm vec shape: ", lstm_input.shape)
+                else:
+                    lstm_input = lstm_in
+                lstm_input = lstm_input.to(f"cuda:{self.temporal_device}")
                 target = target.to(f"cuda:{self.temporal_device}")
 
                 # Forward pass
@@ -740,6 +792,7 @@ class TrainLSTMLoop(IterBasedTrainLoop):
             
     def normalize(self, data):
         #print("input: ", data.shape)
+        #print(d)
         mean_vls = data.view(data.size(0), -1).mean(dim=1, keepdim = True)
         #print("means: ", mean_vls.shape, mean_vls)
         std_vls = data.view(data.size(0), -1).std(dim=1, keepdim = True)
@@ -748,9 +801,28 @@ class TrainLSTMLoop(IterBasedTrainLoop):
         std_vals = std_vls.view(-1,1,1)
        # print("means view: ", mean_vals.shape, mean_vals)
         #print("stds view: ", mean_vals.shape)
-        data_normalized = (data-mean_vals)/std_vals
+        epsilon = 1e-8
+        data_normalized = (data-mean_vals)/(std_vals+ epsilon)
         return data_normalized
+    
+    def maxpool_heatmaps(self, heatmaps):
+        """
+        Given a list of 17 heatmaps, perform max pooling to aggregate them into a single heatmap.
         
+        Args:
+            heatmaps_list (list of torch.Tensor): A list of heatmaps, each of shape (C, H, W).
+            
+        Returns:
+            torch.Tensor: The aggregated heatmap of shape (C, H, W).
+        """
+        # Stack all heatmaps into a single tensor of shape (17, C, H, W)
+        #stacked_heatmaps = torch.stack(heatmaps_list, dim=0)  # Shape: (17, C, H, W)
+        
+        # Perform max pooling across the 17 heatmaps (dim=0), element-wise max pooling
+        pooled_heatmap, _ = torch.max(heatmaps, dim=0)  # Shape: (C, H, W)
+        
+        return pooled_heatmap
+            
         
 def check_mem():
     num_gpus = torch.cuda.device_count()
